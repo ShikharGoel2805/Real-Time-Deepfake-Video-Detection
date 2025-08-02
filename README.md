@@ -1,8 +1,3 @@
-Here is a complete and professional **`README.md`** file for your **Real-Time Deepfake Detection Project**, with all the relevant sections for GitHub:
-
----
-
-````markdown
 # 🧠 Real-Time Deepfake Detection System
 
 This project aims to build a real-time deepfake video detection system that can work with uploaded videos, YouTube links, and live video streams (e.g., Zoom, Google Meet). It leverages deep learning and computer vision techniques to identify manipulated facial movements and inconsistencies in visual and audio patterns.
