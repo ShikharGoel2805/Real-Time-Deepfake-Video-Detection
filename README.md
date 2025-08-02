@@ -102,8 +102,8 @@ deepfake-detector/
 
 ## 👩‍💻 Authors
 
-Ananya Goyal
-Shikhar Goel
+**Ananya Goyal
+**Shikhar Goel
 
 ## 📅 Timeline & Progress
 
