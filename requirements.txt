@@ -1,0 +1,29 @@
+# Core
+torch
+torchvision
+torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+numpy
+pandas
+scikit-learn
+opencv-python
+Pillow
+tqdm
+matplotlib
+albumentations
+timm
+PyYAML
+
+# Face detection
+facenet-pytorch
+
+# Logging / tracking (optional)
+tensorboard
+wandb
+
+# Dev quality tools
+black
+ruff
+mypy
+pre-commit
