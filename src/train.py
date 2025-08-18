@@ -102,3 +102,9 @@ for epoch in range(30):
     print(f"Epoch {epoch+1}, Train Loss: {running_loss/len(train_loader):.4f}, Train Acc: {train_acc:.2f}%")
 
 print("Training Finished ✅")
+
+
+# Save trained model after all epochs finish
+import torch
+torch.save(model.state_dict(), "final_model.pth")
+print("✅ Model saved as final_model.pth")
