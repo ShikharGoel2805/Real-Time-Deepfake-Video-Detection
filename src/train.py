@@ -1,10 +1,8 @@
 # src/train.py
 import timm
-from torch.amp import GradScaler    # NEW (replaces torch.cuda.amp.GradScaler)
-from torch.cuda.amp import autocast  # you can keep this; only GradScaler changed
-
 import os
 import argparse
+import yaml   ### NEW
 from pathlib import Path
 import numpy as np
 
@@ -17,42 +15,66 @@ from torchvision import datasets, transforms, models
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from torch.cuda.amp import autocast, GradScaler
 
-# ---- Config (simple args for now) ----
+from model import build_model   ### NEW (import your model.py)
+
+# ---- Config ----
 def get_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train_dir", type=str, default="data/split/train")
-    ap.add_argument("--val_dir",   type=str, default="data/split/val")
-    ap.add_argument("--backbone",  type=str, default="resnet18", help="resnet18, resnet50, densenet121, etc.")
-    ap.add_argument("--epochs",    type=int, default=15)
-    ap.add_argument("--batch_size",type=int, default=32)
-    ap.add_argument("--lr",        type=float, default=1e-4)
-    ap.add_argument("--weight_decay", type=float, default=1e-4)
-    ap.add_argument("--img_size",  type=int, default=224)
-    ap.add_argument("--patience",  type=int, default=5, help="early stopping patience (epochs)")
-    ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    ap.add_argument("--seed",      type=int, default=42)
+    ap.add_argument("--config", type=str, default="default.yaml", help="Path to YAML config")  ### NEW
+    ap.add_argument("--backbone", type=str, default=None, help="Override model backbone")
+    ap.add_argument("--epochs", type=int, default=None, help="Override training epochs")
+    ap.add_argument("--batch_size", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--weight_decay", type=float, default=None)
+    ap.add_argument("--img_size", type=int, default=None)
+    ap.add_argument("--checkpoint_dir", type=str, default=None)
     return ap.parse_args()
+
+def load_config(yaml_path, cli_args):
+    with open(yaml_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    # Flatten useful parts
+    merged = {
+        "train_dir": "data/split/train",
+        "val_dir": "data/split/val",
+        "backbone": cfg["model"]["backbone"],
+        "epochs": cfg["train"]["epochs"],
+        "batch_size": cfg["data"]["batch_size"],
+        "lr": cfg["train"]["lr"],
+        "weight_decay": cfg["train"]["weight_decay"],
+        "img_size": cfg["data"]["img_size"],
+        "patience": cfg["train"].get("patience", 5),
+        "num_workers": cfg["data"]["num_workers"],
+        "checkpoint_dir": cfg["train"]["checkpoint_dir"],
+        "seed": cfg.get("seed", 42),
+    }
+
+    # Override with CLI if provided
+    if cli_args.backbone: merged["backbone"] = cli_args.backbone
+    if cli_args.epochs: merged["epochs"] = cli_args.epochs
+    if cli_args.batch_size: merged["batch_size"] = cli_args.batch_size
+    if cli_args.lr: merged["lr"] = cli_args.lr
+    if cli_args.weight_decay: merged["weight_decay"] = cli_args.weight_decay
+    if cli_args.img_size: merged["img_size"] = cli_args.img_size
+    if cli_args.checkpoint_dir: merged["checkpoint_dir"] = cli_args.checkpoint_dir
+
+    return merged
 
 def set_seed(seed: int):
     import random
-    import numpy as np
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 # ---- Utilities ----
 class LabelRemapDataset(Dataset):
-    """
-    Wrap an ImageFolder so labels are mapped to {real:0, fake:1} consistently,
-    regardless of folder indexing order inside ImageFolder.
-    """
-    def __init__(self, imagefolder_ds: datasets.ImageFolder, target_map: dict[str,int]):
+    def __init__(self, imagefolder_ds: datasets.ImageFolder, target_map):
         self.ds = imagefolder_ds
-        self.target_map = target_map  # e.g., {"real":0, "fake":1}
-        # build per-class old->new
-        self.idx_to_class = {v:k for k,v in self.ds.class_to_idx.items()}
+        self.idx_to_class = {v: k for k, v in self.ds.class_to_idx.items()}
         self.class_to_new = {old_idx: target_map[self.idx_to_class[old_idx]] for old_idx in self.idx_to_class}
 
     def __len__(self): return len(self.ds)
@@ -63,12 +85,11 @@ class LabelRemapDataset(Dataset):
         return x, torch.tensor(y, dtype=torch.long)
 
 def build_dataloaders(train_dir, val_dir, img_size, batch_size, num_workers):
-    # NOTE: keep transforms simple to match evaluate.py (no ImageNet normalization)
     train_tfms = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.15),
-        transforms.ToTensor(),  # scales to [0,1]
+        transforms.ToTensor(),
     ])
     val_tfms = transforms.Compose([
         transforms.Resize((img_size, img_size)),
@@ -76,65 +97,20 @@ def build_dataloaders(train_dir, val_dir, img_size, batch_size, num_workers):
     ])
 
     train_if = datasets.ImageFolder(train_dir, transform=train_tfms)
-    val_if   = datasets.ImageFolder(val_dir,   transform=val_tfms)
+    val_if = datasets.ImageFolder(val_dir, transform=val_tfms)
 
-    # enforce 0=real, 1=fake regardless of alphabetical order
-    assert set(train_if.classes) >= {"real", "fake"}, \
-        f"Expected 'real' and 'fake' folders under {train_dir}, found: {train_if.classes}"
+    assert set(train_if.classes) >= {"real", "fake"}, f"Expected 'real' and 'fake' folders under {train_dir}"
     target_map = {"real": 0, "fake": 1}
 
     train_ds = LabelRemapDataset(train_if, target_map)
-    val_ds   = LabelRemapDataset(val_if,   target_map)
+    val_ds = LabelRemapDataset(val_if, target_map)
 
     pin = torch.cuda.is_available()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=pin)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=pin)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=pin)
     return train_loader, val_loader, train_if.classes
-
-def build_model(backbone: str, num_classes: int = 2):
-    """
-    Build a model by name. Uses torchvision for common ResNet/DenseNet names,
-    otherwise falls back to timm.create_model for anything else.
-    """
-    tv_backbones = {"resnet18", "resnet50", "densenet121"}
-    if backbone in tv_backbones:
-        if backbone == "resnet18":
-            m = models.resnet18(pretrained=True)
-            in_f = m.fc.in_features
-            m.fc = nn.Linear(in_f, num_classes)
-        elif backbone == "resnet50":
-            m = models.resnet50(pretrained=True)
-            in_f = m.fc.in_features
-            m.fc = nn.Linear(in_f, num_classes)
-        elif backbone == "densenet121":
-            m = models.densenet121(pretrained=True)
-            in_f = m.classifier.in_features
-            m.classifier = nn.Linear(in_f, num_classes)
-        return m
-
-    # Otherwise: use timm (handles tf_efficientnet_b0_ns, convnext_*, vit_*, etc.)
-    m = timm.create_model(
-        backbone,
-        pretrained=True,
-        num_classes=num_classes,   # head replaced for our class count
-        drop_rate=0.2              # mild regularization; tweak if desired
-    )
-
-    # Some timm models expose different head attributes; ensure correct out dim
-    if hasattr(m, "classifier") and isinstance(m.classifier, nn.Linear):
-        if m.classifier.out_features != num_classes:
-            m.classifier = nn.Linear(m.classifier.in_features, num_classes)
-    elif hasattr(m, "fc") and isinstance(m.fc, nn.Linear):
-        if m.fc.out_features != num_classes:
-            m.fc = nn.Linear(m.fc.in_features, num_classes)
-    elif hasattr(m, "head") and isinstance(m.head, nn.Linear):
-        if m.head.out_features != num_classes:
-            m.head = nn.Linear(m.head.in_features, num_classes)
-
-    return m
-
 
 @torch.no_grad()
 def evaluate(model, loader, device):
@@ -143,17 +119,17 @@ def evaluate(model, loader, device):
     for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)
         logits = model(xb)
-        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()  # P(class=1=fake)
+        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
         all_probs.extend(probs.tolist())
-        all_targets.extend(yb.numpy().astype(int).tolist())
+        all_targets.extend(yb.cpu().numpy().astype(int).tolist())
 
     y_true = np.array(all_targets, dtype=int)
     y_prob = np.array(all_probs, dtype=float)
     y_pred = (y_prob >= 0.5).astype(int)
 
     acc = accuracy_score(y_true, y_pred)
-    f1  = f1_score(y_true, y_pred, zero_division=0)
-    prec= precision_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
     try:
         auc = roc_auc_score(y_true, y_prob)
@@ -162,44 +138,49 @@ def evaluate(model, loader, device):
     return acc, auc, f1, prec, rec
 
 def main():
-    args = get_args()
-    set_seed(args.seed)
+    cli_args = get_args()
+    cfg = load_config(cli_args.config, cli_args)   ### NEW
+    set_seed(cfg["seed"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    scaler = GradScaler("cuda", enabled=torch.cuda.is_available())
+    scaler = GradScaler() if torch.cuda.is_available() else None
 
     train_loader, val_loader, classes = build_dataloaders(
-        args.train_dir, args.val_dir, args.img_size, args.batch_size, args.num_workers
+        cfg["train_dir"], cfg["val_dir"], cfg["img_size"], cfg["batch_size"], cfg["num_workers"]
     )
-    num_classes = 2  # we remapped to real(0)/fake(1)
 
-    model = build_model(args.backbone, num_classes=num_classes).to(device)
+    model = build_model(cfg["backbone"], num_classes=2).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, cfg["epochs"]))
 
-    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir = Path(cfg["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_auc = 0.0
-    epochs_no_improve = 0
+    best_auc, epochs_no_improve = 0.0, 0
 
-    print(f"Starting training on {device} | backbone={args.backbone} | classes={classes}")
+    print(f"Starting training on {device} | backbone={cfg['backbone']} | classes={classes}")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, cfg["epochs"] + 1):
         model.train()
         running_loss, total, correct = 0.0, 0, 0
 
         for xb, yb in train_loader:
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
             optimizer.zero_grad()
-            with autocast(enabled=torch.cuda.is_available()):
+            if scaler:
+                with autocast():
+                    logits = model(xb)
+                    loss = criterion(logits, yb)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 logits = model(xb)
                 loss = criterion(logits, yb)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                loss.backward()
+                optimizer.step()
 
-            running_loss += loss.item()
+            running_loss += float(loss.item())
             preds = logits.argmax(1)
             correct += (preds == yb).sum().item()
             total += yb.size(0)
@@ -208,31 +189,25 @@ def main():
         train_acc = correct / max(1, total)
         train_loss = running_loss / max(1, len(train_loader))
 
-        # Validation
         val_acc, val_auc, val_f1, val_prec, val_rec = evaluate(model, val_loader, device)
 
         print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | "
               f"val_acc={val_acc:.4f} | val_auc={val_auc:.4f} | val_f1={val_f1:.4f} | "
               f"val_p={val_prec:.4f} | val_r={val_rec:.4f}")
 
-        # Checkpoint on best AUC
-        improved = (not np.isnan(val_auc)) and (val_auc > best_auc)
-        if improved:
+        if (not np.isnan(val_auc)) and (val_auc > best_auc):
             best_auc = val_auc
-            name = f"{args.backbone}_best.pth"
-            torch.save({"model": model.state_dict(), "epoch": epoch, "metric": {"auc": val_auc}},
-                       ckpt_dir / name)
-            print(f"  ✓ Saved new best checkpoint: {ckpt_dir / name} (AUC={val_auc:.4f})")
+            torch.save({"model_state": model.state_dict(), "epoch": epoch, "metric": {"auc": val_auc}},
+                       ckpt_dir / f"{cfg['backbone']}_best.pth")
+            print(f"  ✓ Saved new best checkpoint (AUC={val_auc:.4f})")
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
 
-        # Early stopping
-        if epochs_no_improve >= args.patience:
-            print(f"Early stopping triggered (no AUC improvement for {args.patience} epochs).")
+        if epochs_no_improve >= cfg["patience"]:
+            print(f"Early stopping (no AUC improvement for {cfg['patience']} epochs).")
             break
 
-    # Save final model in project root for compatibility with your current evaluate flow
     torch.save(model.state_dict(), "final_model.pth")
     print("✅ Training finished. Saved final_model.pth and best checkpoint (if improved).")
 
